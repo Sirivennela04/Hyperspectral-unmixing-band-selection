@@ -55,12 +55,17 @@ if go or "last" in st.session_state:
             bands = bs.select(method, d, sim, k, seed=seed)
         tbs = time.time() - t
         st.session_state["last"] = (ds, method, k, extractor, seed, [int(b) for b in bands], tbs)
-    ds_, method, k, extractor, seed, bands, tbs = st.session_state["last"]
+    # r_* = settings of the last "Run unmixing" click (what the results on screen show).
+    # method / k / extractor / seed keep the CURRENT sidebar values (used by the comparison).
+    ds_, r_method, r_k, r_ext, r_seed, bands, tbs = st.session_state["last"]
     if ds_ != ds:
         st.info("Dataset changed — press **Run unmixing**.")
         st.stop()
-    o = run(ds, tuple(bands), extractor, seed)
-    of = run(ds, tuple(range(B)), extractor, seed)
+    if (r_method, r_k, r_ext, r_seed) != (method, k, extractor, seed):
+        st.warning(f"The sidebar has changed. The results below are still for **{r_method}, k = {r_k}, "
+                   f"{r_ext.upper()}, seed {r_seed}**. Press **Run unmixing** to update them.")
+    o = run(ds, tuple(bands), r_ext, r_seed)
+    of = run(ds, tuple(range(B)), r_ext, r_seed)
 
     c = st.columns(5)
     c[0].metric("Bands used", f"{len(bands)} / {B}", f"-{100 * (1 - len(bands) / B):.0f}% data")
@@ -84,7 +89,7 @@ if go or "last" in st.session_state:
         for b in bands:
             ax.axvline(b, color="r", alpha=0.6, lw=1.3)
         ax.set_xlabel("band index"); ax.legend(fontsize=7, ncol=4); ax.set_xlim(0, B - 1)
-        ax.set_title(f"{method}: {len(bands)} selected bands (red lines)")
+        ax.set_title(f"{r_method}: {len(bands)} selected bands (red lines)")
         st.pyplot(fig)
     with tab2:
         q = min(d["p"], 6)
@@ -101,7 +106,7 @@ if go or "last" in st.session_state:
             st.info("Cuprite has no ground-truth abundances; showing estimated maps only.")
         p = d["p"] if d["A"] is not None else min(d["p"], 6)
         rows = [("Ground truth", d["A"])] if d["A"] is not None else []
-        rows += [("Full bands", of["A"]), (f"{method} ({len(bands)} bands)", o["A"])]
+        rows += [("Full bands", of["A"]), (f"{r_method} ({len(bands)} bands)", o["A"])]
         fig, axs = plt.subplots(len(rows), p, figsize=(2.2 * p, 2.2 * len(rows)))
         axs = np.atleast_2d(axs)
         for r, (lab, A) in enumerate(rows):
@@ -120,14 +125,61 @@ if go or "last" in st.session_state:
         st.pyplot(fig)
         st.caption("Red dots: selected bands on the diagonal. Bright blocks = groups of redundant neighbouring bands.")
 
-    with st.expander("Compare all methods at this k (takes a few seconds)"):
-        if st.button("Run comparison"):
-            res = []
-            for m in bs.METHODS:
-                b = bs.select(m, d, sim, k, seed=seed)
-                r = run(ds, tuple(int(x) for x in b), extractor, seed)
-                res.append(dict(method=m, SAD=r["SAD"], RMSE=r.get("RMSE", np.nan), RE=r["RE"]))
-            res.append(dict(method="Full bands", SAD=of["SAD"], RMSE=of.get("RMSE", np.nan), RE=of["RE"]))
-            st.dataframe(pd.DataFrame(res).set_index("method").style.format("{:.4f}").highlight_min(axis=0))
+    with st.expander("Compare all methods at this k"):
+        st.caption("VCA uses random directions, so a single run is noisy. Compare methods on the mean of several seeds.")
+        t_bench, t_live = st.tabs(["Benchmark averages (5 runs, precomputed)", "Live comparison"])
+        with t_bench:
+            fpath = f"results/sweep_{ds}.csv"
+            try:
+                sw = pd.read_csv(fpath)
+                ks = sorted(sw[sw.method != "Full bands"].k.unique())
+                kb = k if k in ks else min(ks, key=lambda x: abs(x - k))
+                if kb != k:
+                    st.info(f"The benchmark has k = {', '.join(map(str, ks))}; showing k = {kb}.")
+                sub = pd.concat([sw[(sw.k == kb) & (sw.method != "Full bands")], sw[sw.method == "Full bands"]])
+                g = sub.groupby("method")[["SAD", "RMSE", "RE"]].agg(["mean", "std"])
+                order = list(bs.METHODS) + ["Full bands"]
+                g = g.loc[[m for m in order if m in g.index]]
+                means = g.xs("mean", axis=1, level=1).dropna(axis=1, how="all")
+                stds = g.xs("std", axis=1, level=1)[means.columns]
+                show = means.copy().astype(object)
+                for c_ in means.columns:
+                    show[c_] = [f"{mu:.4f} ± {sd:.4f}" for mu, sd in zip(means[c_], stds[c_])]
+                best = {c_: means[c_].drop("Full bands", errors="ignore").idxmin() for c_ in means.columns}
+                st.dataframe(show.style.apply(lambda col: ["background-color: #2e7d32; color: white" if idx == best[col.name] else "" for idx in col.index], axis=0))
+                st.caption(f"k = {kb}, mean ± std of 5 runs (seeds 0–4) from run_experiments.py. Green = best band-selection method per column. Lower is better.")
+            except FileNotFoundError:
+                st.info("Run run_experiments.py first to create the benchmark results.")
+        with t_live:
+            nruns = st.slider("Number of seeds to average", 1, 5, 3, help="Seeds start at the sidebar seed.")
+            st.caption(f"Uses the current sidebar settings: {ds}, k = {k}, {extractor.upper()}, seeds {seed}–{seed + nruns - 1}. "
+                       "Deterministic methods pick the same bands for every seed; Random and GSR-GA-U pick new bands per seed.")
+            if st.button("Run comparison"):
+                res, bar = [], st.progress(0.0)
+                ms = list(bs.METHODS)
+                for i_, m in enumerate(ms):
+                    vals, first_bands = [], None
+                    for s_ in range(seed, seed + nruns):
+                        b = bs.select(m, d, sim, k, seed=s_)
+                        first_bands = first_bands if first_bands is not None else [int(x) for x in b]
+                        r = run(ds, tuple(int(x) for x in b), extractor, s_)
+                        vals.append((r["SAD"], r.get("RMSE", np.nan), r["RE"]))
+                    v = np.array(vals, dtype=float)
+                    res.append(dict(method=m, SAD=v[:, 0].mean(), SAD_std=v[:, 0].std(), RMSE=v[:, 1].mean(), RMSE_std=v[:, 1].std(),
+                                    RE=v[:, 2].mean(), RE_std=v[:, 2].std(), bands=str(first_bands)))
+                    bar.progress((i_ + 1) / (len(ms) + 1))
+                vf = np.array([(lambda r: (r["SAD"], r.get("RMSE", np.nan), r["RE"]))(run(ds, tuple(range(B)), extractor, s_)) for s_ in range(seed, seed + nruns)], dtype=float)
+                res.append(dict(method="Full bands", SAD=vf[:, 0].mean(), SAD_std=vf[:, 0].std(), RMSE=vf[:, 1].mean(), RMSE_std=vf[:, 1].std(),
+                                RE=vf[:, 2].mean(), RE_std=vf[:, 2].std(), bands="all"))
+                bar.progress(1.0)
+                df = pd.DataFrame(res).set_index("method")
+                show = pd.DataFrame(index=df.index)
+                for c_ in ["SAD", "RMSE", "RE"]:
+                    if df[c_].notna().any():
+                        show[c_] = [f"{mu:.4f} ± {sd:.4f}" for mu, sd in zip(df[c_], df[c_ + "_std"])]
+                show["bands (first seed)"] = df["bands"]
+                best = {c_: df[c_].drop("Full bands").idxmin() for c_ in ["SAD", "RMSE", "RE"] if df[c_].notna().any()}
+                st.dataframe(show.style.apply(lambda col: ["background-color: #2e7d32; color: white" if col.name in best and idx == best[col.name] else "" for idx in col.index], axis=0))
+                st.caption("Mean ± std over the chosen seeds. Green = best band-selection method per column. Lower is better.")
 else:
     st.info("Choose settings in the sidebar and press **Run unmixing**.")
